@@ -1,0 +1,8 @@
+node_modules/
+build/
+!src/build/
+dist/
+benchmarks/
+
+# Commit prebuilds for distribution
+# prebuilds/ - DO NOT IGNORE THIS
