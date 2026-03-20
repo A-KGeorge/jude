@@ -65,7 +65,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-          cache-dependency-path: jude-map/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Cache native build
         uses: actions/cache@v4
@@ -110,7 +110,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_DEFAULT }}
           cache: npm
-          cache-dependency-path: jude-map/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Install build tools (Linux)
         if: runner.os == 'Linux'
@@ -200,7 +200,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-          cache-dependency-path: jude-tf/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Restore libtensorflow
         uses: actions/cache@v4
