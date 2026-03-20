@@ -57,6 +57,7 @@ public:
     {
         Napi::Function func = DefineClass(env, "SharedTensor", {
                                                                    InstanceMethod<&SharedTensor::Write>("write"),
+                                                                   InstanceMethod<&SharedTensor::Fill>("fill"),
                                                                    InstanceMethod<&SharedTensor::Read>("read"),
                                                                    InstanceMethod<&SharedTensor::ReadCopy>("readCopy"),
                                                                    InstanceMethod<&SharedTensor::ReadWait>("readWait"),
@@ -178,9 +179,9 @@ private:
     Napi::Env env_ = nullptr;
     void *mapped_ = nullptr;
     size_t mapped_size_ = 0;
-    bool pinned_ = false;              // true after successsful platform_mlock
-    size_t max_bytes_ = 0;             // user-requested capacity (pre-page-rounding)
-    uv_async_t *read_async_ = nullptr; // heap-allocated for independent lifetime
+    bool pinned_ = false;  // true after successsful platform_mlock
+    size_t max_bytes_ = 0; // user-requested capacity (pre-page-rounding)
+    uv_async_t *read_async_ = nullptr;
     bool read_async_initialized_ = false;
     bool read_async_closing_ = false;
     bool env_closing_ = false;
@@ -190,7 +191,6 @@ private:
 
     static void OnAsyncClose(uv_handle_t *handle)
     {
-        // libuv is fully done with this handle — safe to free
         delete reinterpret_cast<uv_async_t *>(handle);
     }
 
@@ -220,7 +220,7 @@ private:
         read_async_->data = nullptr;
         read_async_closing_ = true;
         auto *h = read_async_;
-        read_async_ = nullptr; // ownership transferred to libuv + OnAsyncClose
+        read_async_ = nullptr;
         uv_close(reinterpret_cast<uv_handle_t *>(h), &SharedTensor::OnAsyncClose);
     }
 
@@ -488,6 +488,189 @@ private:
     Napi::Value IsPinned(const Napi::CallbackInfo &info)
     {
         return Napi::Boolean::New(info.Env(), pinned_);
+    }
+
+    // Returns 0 for unknown dtype — caller checks before write_begin.
+    static size_t itemsize_noexcept(DType dt) noexcept
+    {
+        switch (dt)
+        {
+        case DType::FLOAT32:
+            return 4;
+        case DType::FLOAT64:
+            return 8;
+        case DType::INT32:
+            return 4;
+        case DType::INT64:
+            return 8;
+        case DType::UINT8:
+            return 1;
+        case DType::INT8:
+            return 1;
+        case DType::UINT16:
+            return 2;
+        case DType::INT16:
+            return 2;
+        case DType::BOOL:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // typed_fill<T>(dest, n_elems, raw_value)
+    //
+    // Fills n_elems elements of type T at dest with a value cast from the
+    // double that JS passed in. Uses a simple loop — the compiler will
+    // auto-vectorise this with AVX2/NEON given the -O3 + arch flags in
+    // binding.gyp, so no manual SIMD needed.
+    // -----------------------------------------------------------------------
+    template <typename T>
+    static void typed_fill(void *dest, size_t n_elems, double raw_value) noexcept
+    {
+        T val = static_cast<T>(raw_value);
+        T *ptr = reinterpret_cast<T *>(dest);
+        for (size_t i = 0; i < n_elems; ++i)
+            ptr[i] = val;
+    }
+
+    // -----------------------------------------------------------------------
+    // fill(shape: number[], dtype: DType, value: number) → void
+    //
+    // Writes `value` into every element of the tensor defined by `shape` and
+    // `dtype`, entirely inside C++. No V8 buffer is allocated — the data
+    // materialises directly in the mmap region, bypassing the V8 heap ceiling.
+    //
+    // This is the correct path for tensors larger than ~2 GB (e.g. 10 GB LLM
+    // activation buffers) where Buffer.allocUnsafe would throw RangeError.
+    //
+    // Signature mirrors write() for the shape/dtype args so callers can swap
+    // between fill() and write() without restructuring their pipeline setup.
+    // -----------------------------------------------------------------------
+    Napi::Value Fill(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        if (!mapped_)
+        {
+            Napi::Error::New(env, "Destroyed").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        if (info.Length() < 3)
+        {
+            Napi::TypeError::New(env, "fill(shape, dtype, value)").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        // -- shape --
+        if (!info[0].IsArray())
+        {
+            Napi::TypeError::New(env, "shape must be an array").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        Napi::Array shape_arr = info[0].As<Napi::Array>();
+        uint32_t ndim = shape_arr.Length();
+        if (ndim == 0 || ndim > MAX_DIMS)
+        {
+            Napi::RangeError::New(env, "shape rank must be 1..MAX_DIMS").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        // -- dtype --
+        DType dtype;
+        if (info[1].IsNumber())
+            dtype = static_cast<DType>(info[1].As<Napi::Number>().Uint32Value());
+        else
+        {
+            std::string s = info[1].As<Napi::String>().Utf8Value();
+            dtype = dtype_from_string(s.c_str());
+        }
+        if (dtype == DType::UNKNOWN)
+        {
+            Napi::TypeError::New(env, "Unsupported dtype").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        // -- value --
+        if (!info[2].IsNumber())
+        {
+            Napi::TypeError::New(env, "value must be a number").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        double fill_value = info[2].As<Napi::Number>().DoubleValue();
+
+        // -- element count from shape --
+        uint64_t shape[MAX_DIMS] = {};
+        size_t n_elems = 1;
+        for (uint32_t i = 0; i < ndim; ++i)
+        {
+            uint64_t dim = static_cast<uint64_t>(
+                shape_arr.Get(i).As<Napi::Number>().DoubleValue());
+            shape[i] = dim;
+            n_elems *= static_cast<size_t>(dim);
+        }
+
+        size_t itemsize = itemsize_noexcept(dtype);
+        if (itemsize == 0)
+        {
+            Napi::TypeError::New(env, "Cannot determine itemsize for dtype").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        size_t byte_length = n_elems * itemsize;
+
+        if (byte_length > max_bytes_)
+        {
+            Napi::RangeError::New(env, "tensor byte size exceeds segment capacity").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        // -- fill directly in mmap memory --
+        void *dest = segment_data_ptr(mapped_);
+        auto *hdr = reinterpret_cast<SegmentHeader *>(mapped_);
+
+        hdr->seqlock.write_begin();
+
+        switch (dtype)
+        {
+        case DType::FLOAT32:
+            typed_fill<float>(dest, n_elems, fill_value);
+            break;
+        case DType::FLOAT64:
+            typed_fill<double>(dest, n_elems, fill_value);
+            break;
+        case DType::INT32:
+            typed_fill<int32_t>(dest, n_elems, fill_value);
+            break;
+        case DType::INT64:
+            typed_fill<int64_t>(dest, n_elems, fill_value);
+            break;
+        case DType::UINT8:
+            typed_fill<uint8_t>(dest, n_elems, fill_value);
+            break;
+        case DType::INT8:
+            typed_fill<int8_t>(dest, n_elems, fill_value);
+            break;
+        case DType::UINT16:
+            typed_fill<uint16_t>(dest, n_elems, fill_value);
+            break;
+        case DType::INT16:
+            typed_fill<int16_t>(dest, n_elems, fill_value);
+            break;
+        case DType::BOOL:
+            typed_fill<uint8_t>(dest, n_elems, fill_value != 0.0 ? 1.0 : 0.0);
+            break;
+        default:
+            break;
+        }
+
+        hdr->meta.ndim = ndim;
+        hdr->meta.dtype = dtype;
+        hdr->meta.byte_length = byte_length;
+        std::memcpy(hdr->meta.shape, shape, sizeof(shape));
+
+        hdr->seqlock.write_end();
+        signal_pending_reads();
+        return env.Undefined();
     }
 
     Napi::Value Write(const Napi::CallbackInfo &info)

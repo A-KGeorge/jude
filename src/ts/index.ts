@@ -4,29 +4,20 @@ import nodeGypBuild from "node-gyp-build";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
-// Import the native addon - update the path as necessary for your project
-// const {
-//   SharedTensor: NativeSharedTensor,
-// } = require("./build/Release/tensor_bridge");
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 type NativeSharedTensorCtor = new (maxBytes: number) => any;
 
 let NativeSharedTensor: NativeSharedTensorCtor;
-// Load the addon using node-gyp-build
 try {
-  // First, try the path that works when installed
   const addon = nodeGypBuild(join(__dirname, "..")) as any;
   NativeSharedTensor = addon.SharedTensor ?? addon;
 } catch (e) {
   try {
-    // If that fails, try the path that works locally during testing/dev
     const addon = nodeGypBuild(join(__dirname, "..", "..")) as any;
     NativeSharedTensor = addon.SharedTensor ?? addon;
   } catch (err: any) {
-    // If both fail, throw a more informative error
     console.error("Failed to load native SharedTensor module.");
     console.error("Tried using both relative paths.");
     console.error(
@@ -75,10 +66,6 @@ type TypedArray =
   | Uint16Array
   | Int16Array;
 
-/**
- * Mapping of DType to TypedArray constructors.
- * Using the numeric enum as a key is faster than string lookups.
- */
 const TYPED_ARRAY_CTORS: Record<number, any> = {
   [DType.FLOAT32]: Float32Array,
   [DType.FLOAT64]: Float64Array,
@@ -88,19 +75,16 @@ const TYPED_ARRAY_CTORS: Record<number, any> = {
   [DType.INT8]: Int8Array,
   [DType.UINT16]: Uint16Array,
   [DType.INT16]: Int16Array,
-  [DType.BOOL]: Uint8Array, // Packed as uint8
+  [DType.BOOL]: Uint8Array,
 };
 
 export interface TensorResult {
   shape: number[];
   dtype: DType;
   data: TypedArray;
-  version: number; // Added to support the safety check we implemented in C++
+  version: number;
 }
 
-/**
- * Internal helper to wrap raw N-API results into TypedArrays.
- */
 function wrap(result: any): TensorResult | null {
   if (!result) return null;
 
@@ -108,13 +92,11 @@ function wrap(result: any): TensorResult | null {
   if (!Ctor) throw new Error(`Unsupported DType ID: ${result.dtype}`);
 
   const buf = result.buffer;
-
-  // 2. Change type to ArrayBufferLike to accept both buffer types
   let ab: ArrayBufferLike;
   let byteOffset = 0;
 
   if (ArrayBuffer.isView(buf)) {
-    ab = buf.buffer; // This now works with ArrayBufferLike
+    ab = buf.buffer;
     byteOffset = buf.byteOffset;
   } else {
     ab = buf;
@@ -124,7 +106,6 @@ function wrap(result: any): TensorResult | null {
     shape: result.shape,
     dtype: result.dtype,
     version: result.version,
-    // The TypedArray constructor natively accepts ArrayBufferLike
     data: new Ctor(
       ab,
       byteOffset,
@@ -144,23 +125,42 @@ export class SharedTensorSegment {
     return this._native.byteCapacity;
   }
 
-  /**
-   * Whether the backing mmap region is currently page-locked for GPU DMA.
-   */
   get isPinned(): boolean {
     return Boolean(this._native.isPinned);
   }
 
   /**
-   * Write a tensor. Use the DType enum for maximum performance.
+   * Write a tensor from an existing JS buffer.
+   * Subject to V8's ~2 GB TypedArray ceiling — use fill() for large tensors.
    */
   write(shape: number[], dtype: DType, buffer: ArrayBuffer | TypedArray): void {
     this._native.write(shape, dtype, buffer);
   }
 
   /**
+   * Fill every element of the tensor with a scalar value, entirely in C++.
+   *
+   * No V8 buffer is allocated — the data materialises directly in the mmap
+   * region. This is the correct path for tensors larger than ~2 GB where
+   * Buffer.allocUnsafe() would throw RangeError.
+   *
+   * For INT64 the value is cast from a JS number (double). Values outside
+   * the safe integer range (±2^53) will lose precision — BigInt support
+   * can be added if that becomes a requirement.
+   *
+   * @example
+   * // 10 GB float32 tensor — no V8 buffer needed
+   * const GB = 1024 * 1024 * 1024;
+   * const seg = new SharedTensorSegment(10 * GB);
+   * seg.fill([10 * GB / 4], DType.FLOAT32, 0.0);
+   */
+  fill(shape: number[], dtype: DType, value: number): void {
+    this._native.fill(shape, dtype, value);
+  }
+
+  /**
    * Zero-copy read. Returns a view directly into shared memory.
-   * Check 'version' to ensure data wasn't torn during processing.
+   * Valid until the next write() or fill() or destroy().
    */
   read(): TensorResult | null {
     return wrap(this._native.read());
@@ -175,30 +175,27 @@ export class SharedTensorSegment {
 
   /**
    * Promise-based zero-copy read.
-   * Native code spins briefly and then parks until a writer commit wakes it.
+   * Native code spins briefly then parks until a writer commit wakes it.
    */
   async readWait(): Promise<TensorResult | null> {
     return wrap(await this._native.readWait());
   }
 
   /**
-   * Promise-based copy read with spin-then-park behavior.
+   * Promise-based copy read with spin-then-park behaviour.
    */
   async readCopyWait(): Promise<TensorResult | null> {
     return wrap(await this._native.readCopyWait());
   }
 
   /**
-   * Attempt to page-lock the mapped region for CUDA H2D zero-copy paths.
-   * Returns true when the mapping is pinned, false when pinning is not available.
+   * Page-lock the mapped region for CUDA H2D zero-copy paths.
+   * Returns true on success, false if the OS denies the lock (non-fatal).
    */
   pin(): boolean {
     return Boolean(this._native.pin());
   }
 
-  /**
-   * Release page lock if previously pinned.
-   */
   unpin(): void {
     this._native.unpin();
   }
