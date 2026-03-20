@@ -209,6 +209,8 @@ private:
         bool copy;
     };
 
+    struct FillWorkCtx;
+
     static constexpr uint32_t READ_SPIN_LIMIT = 16;
 
     Napi::Env env_ = nullptr;
@@ -223,6 +225,9 @@ private:
     bool cleanup_hook_registered_ = false;
     std::mutex pending_reads_mu_;
     std::deque<std::shared_ptr<PendingRead>> pending_reads_;
+    std::mutex fill_queue_mu_;
+    std::deque<FillWorkCtx *> pending_fills_;
+    bool fill_inflight_ = false;
 
     static void OnAsyncClose(uv_handle_t *handle)
     {
@@ -299,6 +304,42 @@ private:
         std::lock_guard<std::mutex> lock(pending_reads_mu_);
         pending_reads_.clear();
         sync_async_ref_with_pending(false);
+    }
+
+    void enqueue_or_start_fill(FillWorkCtx *ctx)
+    {
+        FillWorkCtx *start_now = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(fill_queue_mu_);
+            if (fill_inflight_)
+            {
+                pending_fills_.push_back(ctx);
+                return;
+            }
+
+            fill_inflight_ = true;
+            start_now = ctx;
+        }
+
+        start_fill_work(start_now);
+    }
+
+    void on_fill_finished()
+    {
+        FillWorkCtx *next = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(fill_queue_mu_);
+            if (pending_fills_.empty())
+            {
+                fill_inflight_ = false;
+                return;
+            }
+
+            next = pending_fills_.front();
+            pending_fills_.pop_front();
+        }
+
+        start_fill_work(next);
     }
 
     static void OnReadAsyncWake(uv_async_t *handle)
@@ -1213,6 +1254,44 @@ private:
         }
     };
 
+    void start_fill_work(FillWorkCtx *ctx)
+    {
+        Napi::Env env = ctx->deferred.Env();
+
+        if (!mapped_)
+        {
+            ctx->deferred.Reject(Napi::Error::New(env, "Destroyed").Value());
+            ctx->self_ref.Unref();
+            delete ctx;
+            on_fill_finished();
+            return;
+        }
+
+        ctx->hdr->seqlock.write_begin();
+
+        uv_loop_t *loop = nullptr;
+        if (napi_get_uv_event_loop(env, &loop) != napi_ok || loop == nullptr)
+        {
+            ctx->hdr->seqlock.write_end();
+            ctx->deferred.Reject(Napi::Error::New(env, "Failed to get uv event loop").Value());
+            ctx->self_ref.Unref();
+            delete ctx;
+            on_fill_finished();
+            return;
+        }
+
+        int rc = uv_queue_work(loop, &ctx->req, &SharedTensor::OnFillWork, &SharedTensor::OnFillAfter);
+        if (rc != 0)
+        {
+            ctx->hdr->seqlock.write_end();
+            ctx->deferred.Reject(Napi::Error::New(env, "Failed to queue fillAsync work").Value());
+            ctx->self_ref.Unref();
+            delete ctx;
+            on_fill_finished();
+            return;
+        }
+    }
+
     // Runs on libuv thread pool thread — NO V8 access allowed.
     static void OnFillWork(uv_work_t *req)
     {
@@ -1241,7 +1320,12 @@ private:
 
         ctx->deferred.Resolve(env.Undefined());
         ctx->self_ref.Unref();
+
+        SharedTensor *owner = ctx->owner;
         delete ctx;
+
+        if (owner)
+            owner->on_fill_finished();
     }
 
     Napi::Value FillAsync(const Napi::CallbackInfo &info)
@@ -1329,27 +1413,7 @@ private:
         ctx->owner = this;
         std::memcpy(ctx->shape, shape, sizeof(shape));
 
-        // write_begin on event loop thread — readers see in-progress immediately.
-        ctx->hdr->seqlock.write_begin();
-
-        // Queue the fill onto libuv's thread pool.
-        uv_loop_t *loop = nullptr;
-        if (napi_get_uv_event_loop(env, &loop) != napi_ok || loop == nullptr)
-        {
-            ctx->hdr->seqlock.write_end();
-            delete ctx;
-            Napi::Error::New(env, "Failed to get uv event loop").ThrowAsJavaScriptException();
-            return env.Undefined();
-        }
-
-        int rc = uv_queue_work(loop, &ctx->req, &SharedTensor::OnFillWork, &SharedTensor::OnFillAfter);
-        if (rc != 0)
-        {
-            ctx->hdr->seqlock.write_end();
-            delete ctx;
-            Napi::Error::New(env, "Failed to queue fillAsync work").ThrowAsJavaScriptException();
-            return env.Undefined();
-        }
+        enqueue_or_start_fill(ctx);
 
         return ctx->deferred.Promise();
     }
