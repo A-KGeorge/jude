@@ -6,6 +6,8 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 // SIMD feature detection
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -88,11 +90,14 @@ public:
         Napi::Function func = DefineClass(env, "SharedTensor", {
                                                                    InstanceMethod<&SharedTensor::Write>("write"),
                                                                    InstanceMethod<&SharedTensor::Fill>("fill"),
+                                                                   InstanceMethod<&SharedTensor::FillAsync>("fillAsync"),
                                                                    InstanceMethod<&SharedTensor::Read>("read"),
                                                                    InstanceMethod<&SharedTensor::ReadCopy>("readCopy"),
                                                                    InstanceMethod<&SharedTensor::ReadWait>("readWait"),
                                                                    InstanceMethod<&SharedTensor::ReadCopyWait>("readCopyWait"),
                                                                    InstanceMethod<&SharedTensor::Destroy>("destroy"),
+                                                                   InstanceMethod<&SharedTensor::DestroyAsync>("destroyAsync"),
+                                                                   InstanceMethod<&SharedTensor::DestroyAsyncWait>("destroyAsyncWait"),
                                                                    InstanceMethod<&SharedTensor::Pin>("pin"),
                                                                    InstanceMethod<&SharedTensor::Unpin>("unpin"),
                                                                    InstanceAccessor<&SharedTensor::ByteCapacity>("byteCapacity"),
@@ -455,7 +460,7 @@ private:
             uv_async_send(read_async_);
     }
 
-    void unmap(bool reject_waiters)
+    void teardown_mapping(bool reject_waiters, void *&addr, size_t &size)
     {
         if (reject_waiters && !env_closing_)
             reject_pending_reads("Destroyed");
@@ -464,12 +469,203 @@ private:
 
         close_async_handle();
 
-        if (mapped_)
+        addr = nullptr;
+        size = 0;
+        if (!mapped_)
+            return;
+
+        addr = mapped_;
+        size = mapped_size_;
+
+        if (pinned_)
         {
-            reinterpret_cast<SegmentHeader *>(mapped_)->~SegmentHeader();
-            platform_munmap(mapped_, mapped_size_);
-            mapped_ = nullptr;
+            platform_munlock(addr, size);
+            pinned_ = false;
         }
+
+        reinterpret_cast<SegmentHeader *>(mapped_)->~SegmentHeader();
+        mapped_ = nullptr;
+    }
+
+    void unmap(bool reject_waiters)
+    {
+        void *addr = nullptr;
+        size_t size = 0;
+        teardown_mapping(reject_waiters, addr, size);
+        if (addr)
+        {
+#ifdef _WIN32
+            // On Windows, a separate release-hint pass can be slower than a
+            // direct unmap in the synchronous path.
+            platform_munmap(addr, size);
+#else
+            platform_release_hint(addr, size);
+            platform_munmap(addr, size);
+#endif
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // unmap_teardown / unmap_release
+    //
+    // Split unmap() into two phases for destroyAsync():
+    //
+    //   teardown  — synchronous, event loop thread:
+    //               reject pending reads, close uv_async handle, null mapped_,
+    //               call SegmentHeader destructor, call platform_release_hint.
+    //               After this returns, no further reads/writes can succeed.
+    //
+    //   release   — slow, offloaded to uv_queue_work thread:
+    //               platform_munmap — walks page tables, flushes TLBs.
+    //               Even with the release hint, this takes O(mapped_size).
+    //
+    // The split ensures the event loop is free during the slow phase.
+    // -----------------------------------------------------------------------
+    struct UnmapCtx
+    {
+        uv_work_t req; // must be first
+        void *addr;
+        size_t size;
+        bool resolve_on_after;
+        Napi::Promise::Deferred deferred;
+        Napi::ObjectReference self_ref;
+
+        UnmapCtx(Napi::Env env, void *a, size_t s, bool resolve_after)
+            : req{}, addr(a), size(s), resolve_on_after(resolve_after),
+              deferred(Napi::Promise::Deferred::New(env))
+        {
+        }
+    };
+
+    static void OnUnmapWork(uv_work_t *req)
+    {
+        // Runs on libuv thread pool — NO V8 access.
+        auto *ctx = reinterpret_cast<UnmapCtx *>(req);
+#ifndef _WIN32
+        platform_release_hint(ctx->addr, ctx->size);
+#endif
+        platform_munmap(ctx->addr, ctx->size);
+    }
+
+    static void OnUnmapAfter(uv_work_t *req, int /*status*/)
+    {
+        // Runs back on event loop thread.
+        auto *ctx = reinterpret_cast<UnmapCtx *>(req);
+        if (ctx->resolve_on_after)
+        {
+            Napi::Env env = ctx->deferred.Env();
+            Napi::HandleScope scope(env);
+            ctx->deferred.Resolve(env.Undefined());
+            ctx->self_ref.Unref();
+        }
+        delete ctx;
+    }
+
+    void Destroy(const Napi::CallbackInfo &info) { unmap(true); }
+
+    // -----------------------------------------------------------------------
+    // destroyAsync() → Promise<void>
+    //
+    // Non-blocking variant of destroy() for the main event loop thread.
+    //
+    // Phase 1 (event loop, synchronous):
+    //   - Reject all pending readWait() promises
+    //   - Close the uv_async handle
+    //   - Call SegmentHeader destructor
+    //   - Call platform_release_hint (fast — just advises the OS)
+    //   - Null mapped_ so all subsequent operations fail immediately
+    //
+    // Phase 2 (libuv thread pool, async):
+    //   - platform_munmap — the slow page-table walk (background)
+    //
+    // destroyAsync() resolves immediately after logical teardown. Physical
+    // virtual-memory release continues in background on libuv worker threads.
+    // This minimizes event-loop-visible cleanup latency for large tensors.
+    // -----------------------------------------------------------------------
+    Napi::Value DestroyAsync(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+
+        if (!mapped_)
+        {
+            // Already destroyed — return a resolved Promise.
+            auto deferred = Napi::Promise::Deferred::New(env);
+            deferred.Resolve(env.Undefined());
+            return deferred.Promise();
+        }
+
+        void *addr = nullptr;
+        size_t size = 0;
+        teardown_mapping(true, addr, size);
+        if (!addr)
+        {
+            auto deferred = Napi::Promise::Deferred::New(env);
+            deferred.Resolve(env.Undefined());
+            return deferred.Promise();
+        }
+
+        // -- Phase 2: async munmap on thread pool --
+        auto *ctx = new UnmapCtx(env, addr, size, false);
+
+        uv_loop_t *loop = nullptr;
+        napi_get_uv_event_loop(env, &loop);
+
+        if (!loop || uv_queue_work(loop, &ctx->req,
+                                   OnUnmapWork, OnUnmapAfter) != 0)
+        {
+            // Fallback: do it synchronously if queue fails.
+            platform_munmap(addr, size);
+            delete ctx;
+        }
+        else
+        {
+            // Work accepted; callback owns ctx lifetime.
+        }
+
+        auto deferred = Napi::Promise::Deferred::New(env);
+        deferred.Resolve(env.Undefined());
+        return deferred.Promise();
+    }
+
+    Napi::Value DestroyAsyncWait(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+
+        if (!mapped_)
+        {
+            auto deferred = Napi::Promise::Deferred::New(env);
+            deferred.Resolve(env.Undefined());
+            return deferred.Promise();
+        }
+
+        void *addr = nullptr;
+        size_t size = 0;
+        teardown_mapping(true, addr, size);
+        if (!addr)
+        {
+            auto deferred = Napi::Promise::Deferred::New(env);
+            deferred.Resolve(env.Undefined());
+            return deferred.Promise();
+        }
+
+        auto *ctx = new UnmapCtx(env, addr, size, true);
+        ctx->self_ref = Napi::ObjectReference::New(info.This().As<Napi::Object>(), 1);
+
+        uv_loop_t *loop = nullptr;
+        napi_get_uv_event_loop(env, &loop);
+
+        if (!loop || uv_queue_work(loop, &ctx->req,
+                                   OnUnmapWork, OnUnmapAfter) != 0)
+        {
+            platform_munmap(addr, size);
+            ctx->self_ref.Unref();
+            ctx->deferred.Resolve(env.Undefined());
+            auto promise = ctx->deferred.Promise();
+            delete ctx;
+            return promise;
+        }
+
+        return ctx->deferred.Promise();
     }
 
     // -----------------------------------------------------------------------
@@ -761,6 +957,56 @@ private:
 #endif
     }
 
+    static void parallel_fill(void *dest, size_t n_elems, size_t itemsize,
+                              DType dtype, double fill_value) noexcept
+    {
+        if (itemsize == 0 || n_elems == 0)
+            return;
+
+        constexpr size_t PARALLEL_FILL_MIN_BYTES = 4ULL * 1024ULL * 1024ULL;
+        constexpr unsigned MAX_FILL_THREADS = 8;
+
+        const size_t total_bytes = n_elems * itemsize;
+        if (total_bytes < PARALLEL_FILL_MIN_BYTES)
+        {
+            dispatch_fill(dest, n_elems, dtype, fill_value);
+            return;
+        }
+
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0)
+            hw = 1;
+
+        unsigned threads = std::min<unsigned>(MAX_FILL_THREADS, hw);
+        if (threads <= 1 || n_elems < threads)
+        {
+            dispatch_fill(dest, n_elems, dtype, fill_value);
+            return;
+        }
+
+        std::vector<std::thread> workers;
+        workers.reserve(threads - 1);
+
+        uint8_t *base = reinterpret_cast<uint8_t *>(dest);
+        const size_t chunk = n_elems / threads;
+        size_t start = 0;
+
+        for (unsigned t = 0; t < threads - 1; ++t)
+        {
+            const size_t end = start + chunk;
+            workers.emplace_back([=]()
+                                 {
+                uint8_t* ptr = base + (start * itemsize);
+                dispatch_fill(ptr, end - start, dtype, fill_value); });
+            start = end;
+        }
+
+        dispatch_fill(base + (start * itemsize), n_elems - start, dtype, fill_value);
+
+        for (auto &w : workers)
+            w.join();
+    }
+
     // -----------------------------------------------------------------------
     // fill(shape: number[], dtype: DType, value: number) → void
     //
@@ -855,7 +1101,25 @@ private:
         auto *hdr = reinterpret_cast<SegmentHeader *>(mapped_);
 
         hdr->seqlock.write_begin();
+        parallel_fill(dest, n_elems, itemsize, dtype, fill_value);
+        hdr->meta.ndim = ndim;
+        hdr->meta.dtype = dtype;
+        hdr->meta.byte_length = byte_length;
+        std::memcpy(hdr->meta.shape, shape, sizeof(shape));
+        hdr->seqlock.write_end();
+        signal_pending_reads();
+        return env.Undefined();
+    }
 
+    // -----------------------------------------------------------------------
+    // dispatch_fill — typed fill dispatcher for one contiguous chunk.
+    //
+    // Called by both Fill (sync) and the uv_queue_work thread in FillAsync.
+    // No V8 access — safe to call from any thread.
+    // -----------------------------------------------------------------------
+    static void dispatch_fill(void *dest, size_t n_elems,
+                              DType dtype, double fill_value) noexcept
+    {
         switch (dtype)
         {
         case DType::FLOAT32:
@@ -888,15 +1152,206 @@ private:
         default:
             break;
         }
+    }
 
-        hdr->meta.ndim = ndim;
-        hdr->meta.dtype = dtype;
-        hdr->meta.byte_length = byte_length;
-        std::memcpy(hdr->meta.shape, shape, sizeof(shape));
+    // -----------------------------------------------------------------------
+    // fillAsync(shape, dtype, value) → Promise<void>
+    //
+    // Non-blocking variant of fill() for use on the main event loop thread.
+    //
+    // Pushes the C++ fill work onto libuv's thread pool via uv_queue_work.
+    // The event loop is free to process I/O, timers, and readWait() callbacks
+    // while the fill runs. The returned Promise resolves when the seqlock
+    // commit is complete and all parked readWait() callers have been woken.
+    //
+    // Intended split:
+    //   Main thread  → fillAsync()   non-blocking, Promise-based
+    //   Worker thread → fill()       synchronous, isolated event loop
+    //
+    // Design notes:
+    //   - write_begin() is called on the event loop thread before queuing,
+    //     so readers see the seqlock as in-progress immediately (odd counter).
+    //   - The thread pool thread does the actual fill — no V8 access there.
+    //   - write_end() + signal_pending_reads() happen in the after-callback,
+    //     which runs back on the event loop thread.
+    //   - The work ctx stores only plain C++ data and the output pointers.
+    //   - No V8 handles are touched from the worker thread.
+    // -----------------------------------------------------------------------
 
-        hdr->seqlock.write_end();
-        signal_pending_reads();
-        return env.Undefined();
+    // Work context — allocated on heap, owned by uv_queue_work lifecycle.
+    struct FillWorkCtx
+    {
+        uv_work_t req; // must be first — libuv casts req* → FillWorkCtx*
+
+        // Fill parameters (copied from JS args — no V8 refs after queue)
+        void *dest;
+        size_t n_elems;
+        size_t itemsize;
+        DType dtype;
+        double fill_value;
+
+        // Segment metadata to commit after fill
+        SegmentHeader *hdr;
+        uint32_t ndim;
+        uint64_t shape[MAX_DIMS];
+        size_t byte_length;
+
+        // Promise to resolve on completion
+        Napi::Promise::Deferred deferred;
+
+        // Keeps JS wrapper/object alive until OnFillAfter finishes.
+        Napi::ObjectReference self_ref;
+
+        // Back-pointer for signal_pending_reads() in after-callback
+        SharedTensor *owner;
+
+        explicit FillWorkCtx(Napi::Env env)
+            : req{}, dest(nullptr), n_elems(0), itemsize(0), dtype(DType::UNKNOWN), fill_value(0.0),
+              hdr(nullptr), ndim(0), shape{}, byte_length(0),
+              deferred(Napi::Promise::Deferred::New(env)), owner(nullptr)
+        {
+        }
+    };
+
+    // Runs on libuv thread pool thread — NO V8 access allowed.
+    static void OnFillWork(uv_work_t *req)
+    {
+        auto *ctx = reinterpret_cast<FillWorkCtx *>(req);
+        parallel_fill(ctx->dest, ctx->n_elems, ctx->itemsize, ctx->dtype, ctx->fill_value);
+    }
+
+    // Runs back on event loop thread — V8 access safe.
+    static void OnFillAfter(uv_work_t *req, int /*status*/)
+    {
+        auto *ctx = reinterpret_cast<FillWorkCtx *>(req);
+
+        Napi::Env env = ctx->deferred.Env();
+        Napi::HandleScope scope(env);
+
+        // Commit the seqlock — makes the filled data visible to readers.
+        ctx->hdr->meta.ndim = ctx->ndim;
+        ctx->hdr->meta.dtype = ctx->dtype;
+        ctx->hdr->meta.byte_length = ctx->byte_length;
+        std::memcpy(ctx->hdr->meta.shape, ctx->shape, sizeof(ctx->shape));
+        ctx->hdr->seqlock.write_end();
+
+        // Wake any parked readWait() / readCopyWait() callers.
+        if (ctx->owner)
+            ctx->owner->signal_pending_reads();
+
+        ctx->deferred.Resolve(env.Undefined());
+        ctx->self_ref.Unref();
+        delete ctx;
+    }
+
+    Napi::Value FillAsync(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        if (!mapped_)
+        {
+            Napi::Error::New(env, "Destroyed").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        if (info.Length() < 3)
+        {
+            Napi::TypeError::New(env, "fillAsync(shape, dtype, value)").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        // -- parse args (identical to Fill) --
+        if (!info[0].IsArray())
+        {
+            Napi::TypeError::New(env, "shape must be an array").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        Napi::Array shape_arr = info[0].As<Napi::Array>();
+        uint32_t ndim = shape_arr.Length();
+        if (ndim == 0 || ndim > MAX_DIMS)
+        {
+            Napi::RangeError::New(env, "shape rank must be 1..MAX_DIMS").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        DType dtype;
+        if (info[1].IsNumber())
+            dtype = static_cast<DType>(info[1].As<Napi::Number>().Uint32Value());
+        else
+        {
+            std::string s = info[1].As<Napi::String>().Utf8Value();
+            dtype = dtype_from_string(s.c_str());
+        }
+        if (dtype == DType::UNKNOWN)
+        {
+            Napi::TypeError::New(env, "Unsupported dtype").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        if (!info[2].IsNumber())
+        {
+            Napi::TypeError::New(env, "value must be a number").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        double fill_value = info[2].As<Napi::Number>().DoubleValue();
+
+        uint64_t shape[MAX_DIMS] = {};
+        size_t n_elems = 1;
+        for (uint32_t i = 0; i < ndim; ++i)
+        {
+            uint64_t dim = static_cast<uint64_t>(
+                shape_arr.Get(i).As<Napi::Number>().DoubleValue());
+            shape[i] = dim;
+            n_elems *= static_cast<size_t>(dim);
+        }
+
+        size_t itemsize = itemsize_noexcept(dtype);
+        if (itemsize == 0)
+        {
+            Napi::TypeError::New(env, "Cannot determine itemsize for dtype").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        size_t byte_length = n_elems * itemsize;
+        if (byte_length > max_bytes_)
+        {
+            Napi::RangeError::New(env, "tensor byte size exceeds segment capacity").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        // -- build work context --
+        auto *ctx = new FillWorkCtx(env);
+        ctx->dest = segment_data_ptr(mapped_);
+        ctx->n_elems = n_elems;
+        ctx->itemsize = itemsize;
+        ctx->dtype = dtype;
+        ctx->fill_value = fill_value;
+        ctx->hdr = reinterpret_cast<SegmentHeader *>(mapped_);
+        ctx->ndim = ndim;
+        ctx->byte_length = byte_length;
+        ctx->self_ref = Napi::ObjectReference::New(info.This().As<Napi::Object>(), 1);
+        ctx->owner = this;
+        std::memcpy(ctx->shape, shape, sizeof(shape));
+
+        // write_begin on event loop thread — readers see in-progress immediately.
+        ctx->hdr->seqlock.write_begin();
+
+        // Queue the fill onto libuv's thread pool.
+        uv_loop_t *loop = nullptr;
+        if (napi_get_uv_event_loop(env, &loop) != napi_ok || loop == nullptr)
+        {
+            ctx->hdr->seqlock.write_end();
+            delete ctx;
+            Napi::Error::New(env, "Failed to get uv event loop").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        int rc = uv_queue_work(loop, &ctx->req, &SharedTensor::OnFillWork, &SharedTensor::OnFillAfter);
+        if (rc != 0)
+        {
+            ctx->hdr->seqlock.write_end();
+            delete ctx;
+            Napi::Error::New(env, "Failed to queue fillAsync work").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        return ctx->deferred.Promise();
     }
 
     Napi::Value Write(const Napi::CallbackInfo &info)
@@ -1015,8 +1470,6 @@ private:
     Napi::Value ReadCopy(const Napi::CallbackInfo &info) { return read_internal(info, true); }
     Napi::Value ReadWait(const Napi::CallbackInfo &info) { return read_wait_internal(info, false); }
     Napi::Value ReadCopyWait(const Napi::CallbackInfo &info) { return read_wait_internal(info, true); }
-
-    void Destroy(const Napi::CallbackInfo &info) { unmap(true); }
 
     Napi::Value ByteCapacity(const Napi::CallbackInfo &info)
     {

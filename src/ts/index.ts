@@ -138,24 +138,30 @@ export class SharedTensorSegment {
   }
 
   /**
-   * Fill every element of the tensor with a scalar value, entirely in C++.
+   * Fill every element with a scalar value, entirely in C++.
+   * Synchronous — blocks the calling thread until complete.
    *
-   * No V8 buffer is allocated — the data materialises directly in the mmap
-   * region. This is the correct path for tensors larger than ~2 GB where
-   * Buffer.allocUnsafe() would throw RangeError.
-   *
-   * For INT64 the value is cast from a JS number (double). Values outside
-   * the safe integer range (±2^53) will lose precision — BigInt support
-   * can be added if that becomes a requirement.
-   *
-   * @example
-   * // 10 GB float32 tensor — no V8 buffer needed
-   * const GB = 1024 * 1024 * 1024;
-   * const seg = new SharedTensorSegment(10 * GB);
-   * seg.fill([10 * GB / 4], DType.FLOAT32, 0.0);
+   * Use on Worker threads where blocking the isolated event loop is fine.
+   * Use fillAsync() on the main thread to keep the event loop alive.
    */
   fill(shape: number[], dtype: DType, value: number): void {
     this._native.fill(shape, dtype, value);
+  }
+
+  /**
+   * Non-blocking variant of fill() for the main event loop thread.
+   *
+   * Pushes the C++ fill onto libuv's thread pool. The event loop stays free
+   * to process I/O, timers, and readWait() callbacks while the fill runs.
+   * Resolves when the seqlock commit is complete and readWait() callers
+   * have been woken.
+   *
+   * @example
+   * // Main thread — event loop stays alive during 10 GB fill
+   * await seg.fillAsync([N_ELEMS], DType.FLOAT32, 0.0);
+   */
+  async fillAsync(shape: number[], dtype: DType, value: number): Promise<void> {
+    return this._native.fillAsync(shape, dtype, value);
   }
 
   /**
@@ -200,7 +206,35 @@ export class SharedTensorSegment {
     this._native.unpin();
   }
 
+  /**
+   * Synchronous destroy. Blocks the event loop during munmap.
+   * Use on Worker threads. On the main thread prefer destroyAsync().
+   */
   destroy(): void {
     this._native.destroy();
+  }
+
+  /**
+   * Low-latency destroy for the main event loop thread.
+   *
+   * Resolves immediately after logical teardown (pointer nulled, pending
+   * waiters rejected, future ops throw "Destroyed"). Physical munmap runs in
+   * the background on the libuv worker pool.
+   *
+   * @example
+   * await seg.destroyAsync(); // returns quickly after logical teardown
+   */
+  async destroyAsync(): Promise<void> {
+    return this._native.destroyAsync();
+  }
+
+  /**
+   * Strict async destroy: resolves only after full OS unmap completes.
+   *
+   * Use this when you need an explicit synchronization point for resource
+   * release (e.g. deterministic teardown sequencing in benchmarks/tests).
+   */
+  async destroyAsyncWait(): Promise<void> {
+    return this._native.destroyAsyncWait();
   }
 }
