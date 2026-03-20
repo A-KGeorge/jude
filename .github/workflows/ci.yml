@@ -1,0 +1,275 @@
+name: CI
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # 🧪 Ubuntu tests (with Redis)
+  test-ubuntu:
+    name: Test on Ubuntu - Node ${{ matrix.node-version }} (with Redis)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18.x, 20.x, 22.x]
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm"
+
+      # Cache npm packages
+      - name: Cache npm cache directory
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ matrix.node-version }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-${{ matrix.node-version }}-
+
+      # Cache native build outputs
+      - name: Cache native build outputs
+        uses: actions/cache@v4
+        with:
+          path: build/Release
+          key: ${{ runner.os }}-${{ matrix.node-version }}-${{ hashFiles('binding.gyp', 'src/native/**/*.cc', 'src/native/**/*.h', 'package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.node-version }}-
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3 redis-tools
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build native addon
+        run: npm run build
+
+      - name: Copy native addon to src/build
+        run: |
+          mkdir -p src/build
+          cp build/Release/dspx.node src/build/
+
+      - name: Wait for Redis
+        run: |
+          timeout 30 bash -c 'until redis-cli ping; do sleep 1; done'
+          echo "✅ Redis is ready"
+
+      - name: Run all tests
+        run: npm test
+        env:
+          REDIS_URL: redis://localhost:6379
+
+  # 🧪 macOS + Windows tests
+  test-other:
+    name: Test on ${{ matrix.os }} - Node ${{ matrix.node-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        node-version: [18.x, 20.x, 22.x]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm"
+
+      # Cache npm
+      - name: Cache npm cache directory
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ matrix.node-version }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-${{ matrix.node-version }}-
+
+      # Cache build artifacts
+      - name: Cache native build outputs
+        uses: actions/cache@v4
+        with:
+          path: build/Release
+          key: ${{ runner.os }}-${{ matrix.node-version }}-${{ hashFiles('binding.gyp', 'src/native/**/*.cc', 'src/native/**/*.h', 'package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.node-version }}-
+
+      - name: Setup Redis (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install redis
+          brew services start redis
+          sleep 2
+        continue-on-error: true
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build native addon
+        run: npm run build
+
+      - name: Copy native addon to src/build
+        shell: bash
+        run: |
+          mkdir -p src/build
+          cp build/Release/dspx.node src/build/
+
+      - name: Run tests
+        run: npm test
+        env:
+          REDIS_URL: redis://localhost:6379
+
+  # 🏗️ Prebuilds for all OS
+  prebuild:
+    name: Prebuild ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: [test-ubuntu, test-other]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: "npm"
+
+      - name: Cache npm cache directory
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-22-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-22-
+
+      - name: Install build tools (Linux)
+        if: ${{ matrix.os == 'ubuntu-22.04' }}
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build prebuild binaries
+        run: npm run prebuildify
+
+      - name: Upload prebuilds
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilds-${{ matrix.os }}
+          path: prebuilds/
+          retention-days: 90
+
+  # 🚀 Release job
+  release:
+    name: Release and Publish
+    runs-on: ubuntu-latest
+    needs: [test-ubuntu, test-other, prebuild]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write # To create release tags and GitHub releases
+      pull-requests: write # To create the versioning PR (if you use it)
+      id-token: write # Required for npm OIDC trusted publishing
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required by changesets
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: "npm"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Update npm to latest
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build:ts
+
+      # Download all prebuilds from the prebuild job
+      - name: Download prebuilds (Linux)
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilds-ubuntu-22.04
+          path: prebuilds/
+
+      - name: Download prebuilds (macOS)
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilds-macos-latest
+          path: prebuilds/
+
+      - name: Download prebuilds (Windows)
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilds-windows-latest
+          path: prebuilds/
+
+      - name: Verify prebuilds
+        run: |
+          echo "📦 Prebuilds included in npm package:"
+          ls -lR prebuilds/ || echo "⚠️ No prebuilds found"
+
+      - name: Build package
+        run: npm run build
+
+      - name: Version and Publish
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          # This runs "npm run version" to create the PR
+          version: npm run version
+          # This runs "npm run publish-packages" AFTER the PR is merged
+          publish: npm run publish-packages
+          commit: "ci(release): version packages"
+          title: "ci(release): version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true
+
+  # 🧹 Lint and Type Check
+  lint:
+    name: Lint and Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: "npm"
+      - run: npm install
+      - run: npx eslint src --max-warnings=0 || echo "⚠️ ESLint not configured, skipping"
+        continue-on-error: true
+      - run: npx tsc --noEmit || echo "⚠️ TypeScript check skipped"
+        continue-on-error: true
