@@ -1,5 +1,11 @@
 # jude-map
 
+## 0.0.1
+
+### Patch Changes
+
+- [`2f10db3`](https://github.com/A-KGeorge/jude-map/commit/2f10db3900d9e1fc404ec2da6da31018d3fe0eb6) Thanks [@A-KGeorge](https://github.com/A-KGeorge)! - Added new method to allocate more than 10 GB
+
 ## 0.0.0
 
 ### Patch Changes
