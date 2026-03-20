@@ -11,25 +11,14 @@ on:
     branches: [main]
 
 jobs:
-  # 🧪 Ubuntu tests (with Redis)
+  # 🧪 Ubuntu tests
   test-ubuntu:
-    name: Test on Ubuntu - Node ${{ matrix.node-version }} (with Redis)
+    name: Test on Ubuntu - Node ${{ matrix.node-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         node-version: [18.x, 20.x, 22.x]
-
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +47,7 @@ jobs:
             ${{ runner.os }}-${{ matrix.node-version }}-
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential python3 redis-tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
       - name: Install dependencies
         run: npm install
@@ -71,15 +60,8 @@ jobs:
           mkdir -p src/build
           cp build/Release/jude-map.node src/build/
 
-      - name: Wait for Redis
-        run: |
-          timeout 30 bash -c 'until redis-cli ping; do sleep 1; done'
-          echo "✅ Redis is ready"
-
       - name: Run all tests
         run: npm test
-        env:
-          REDIS_URL: redis://localhost:6379
 
   # 🧪 macOS + Windows tests
   test-other:
@@ -117,14 +99,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.node-version }}-
 
-      - name: Setup Redis (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew install redis
-          brew services start redis
-          sleep 2
-        continue-on-error: true
-
       - name: Install dependencies
         run: npm install
 
@@ -139,8 +113,6 @@ jobs:
 
       - name: Run tests
         run: npm test
-        env:
-          REDIS_URL: redis://localhost:6379
 
   # 🏗️ Prebuilds for all OS
   prebuild:

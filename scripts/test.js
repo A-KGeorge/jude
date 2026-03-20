@@ -12,8 +12,15 @@ const testFiles = readdirSync(testDir)
   .filter((file) => file.endsWith(".test.ts"))
   .map((file) => join(testDir, file));
 
-// Run node test runner with all test files
-const args = ["--import", "tsx", "--test", ...testFiles];
+// Run node test runner with all test files serially to avoid cross-file
+// native teardown races while still preserving all test coverage.
+const args = [
+  "--import",
+  "tsx",
+  "--test",
+  "--test-concurrency=1",
+  ...testFiles,
+];
 const child = spawn("node", args, {
   stdio: "inherit",
   shell: true,

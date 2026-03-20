@@ -86,6 +86,7 @@ public:
         }
 
         size_t max_bytes = static_cast<size_t>(info[0].As<Napi::Number>().DoubleValue());
+        max_bytes_ = max_bytes; // store before page-rounding
         mapped_size_ = DATA_OFFSET + max_bytes;
 
         // Round up to page boundary
@@ -118,18 +119,39 @@ public:
             return;
         }
 
-        if (uv_async_init(loop, &read_async_, &SharedTensor::OnReadAsyncWake) != 0)
+        read_async_ = new uv_async_t{};
+        if (uv_async_init(loop, read_async_, &SharedTensor::OnReadAsyncWake) != 0)
         {
+            delete read_async_;
+            read_async_ = nullptr;
             unmap(false);
             Napi::Error::New(env, "Failed to initialize uv_async handle").ThrowAsJavaScriptException();
             return;
         }
 
-        read_async_.data = this;
+        read_async_->data = this;
+
+        uv_unref(reinterpret_cast<uv_handle_t *>(read_async_));
+        // uv_unref marks this handle as weak — it won't prevent the event loop
+        // from exiting when all other work is done. Without this, any surviving
+        // SharedTensor instance (e.g. GC'd after loop teardown) causes the
+        // uv__finish_close assertion on macOS and Linux.
+
         read_async_initialized_ = true;
+
+        napi_add_env_cleanup_hook(env, &SharedTensor::OnEnvCleanup, this);
+        cleanup_hook_registered_ = true;
     }
 
-    ~SharedTensor() { unmap(false); }
+    ~SharedTensor()
+    {
+        if (cleanup_hook_registered_ && !env_closing_)
+        {
+            napi_remove_env_cleanup_hook(env_, &SharedTensor::OnEnvCleanup, this);
+            cleanup_hook_registered_ = false;
+        }
+        unmap(false);
+    }
 
 private:
     enum class ReadStatus
@@ -156,22 +178,68 @@ private:
     Napi::Env env_ = nullptr;
     void *mapped_ = nullptr;
     size_t mapped_size_ = 0;
-    bool pinned_ = false; // true after successsful platform_mlock
-    uv_async_t read_async_{};
+    bool pinned_ = false;              // true after successsful platform_mlock
+    size_t max_bytes_ = 0;             // user-requested capacity (pre-page-rounding)
+    uv_async_t *read_async_ = nullptr; // heap-allocated for independent lifetime
     bool read_async_initialized_ = false;
     bool read_async_closing_ = false;
+    bool env_closing_ = false;
+    bool cleanup_hook_registered_ = false;
     std::mutex pending_reads_mu_;
     std::deque<std::shared_ptr<PendingRead>> pending_reads_;
 
-    void close_async_handle()
+    static void OnAsyncClose(uv_handle_t *handle)
     {
-        if (!read_async_initialized_ || read_async_closing_)
+        // libuv is fully done with this handle — safe to free
+        delete reinterpret_cast<uv_async_t *>(handle);
+    }
+
+    static void OnEnvCleanup(void *data)
+    {
+        auto *self = static_cast<SharedTensor *>(data);
+        if (!self)
             return;
 
-        // Prevent any in-flight async callback from dereferencing this object.
-        read_async_.data = nullptr;
+        self->env_closing_ = true;
+        self->cleanup_hook_registered_ = false;
+        self->clear_pending_reads();
+        self->close_async_handle();
+    }
+
+    void close_async_handle()
+    {
+        if (!read_async_ || read_async_closing_)
+            return;
+
+        if (uv_is_closing(reinterpret_cast<uv_handle_t *>(read_async_)))
+        {
+            read_async_closing_ = true;
+            return;
+        }
+
+        read_async_->data = nullptr;
         read_async_closing_ = true;
-        uv_close(reinterpret_cast<uv_handle_t *>(&read_async_), nullptr);
+        auto *h = read_async_;
+        read_async_ = nullptr; // ownership transferred to libuv + OnAsyncClose
+        uv_close(reinterpret_cast<uv_handle_t *>(h), &SharedTensor::OnAsyncClose);
+    }
+
+    void sync_async_ref_with_pending(bool has_pending)
+    {
+        if (!read_async_ || read_async_closing_)
+            return;
+
+        auto *h = reinterpret_cast<uv_handle_t *>(read_async_);
+        if (has_pending)
+        {
+            if (!uv_has_ref(h))
+                uv_ref(h);
+        }
+        else
+        {
+            if (uv_has_ref(h))
+                uv_unref(h);
+        }
     }
 
     void reject_pending_reads(const char *message)
@@ -182,6 +250,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(pending_reads_mu_);
             pending.swap(pending_reads_);
+            sync_async_ref_with_pending(false);
         }
 
         for (const auto &item : pending)
@@ -194,6 +263,7 @@ private:
     {
         std::lock_guard<std::mutex> lock(pending_reads_mu_);
         pending_reads_.clear();
+        sync_async_ref_with_pending(false);
     }
 
     static void OnReadAsyncWake(uv_async_t *handle)
@@ -205,7 +275,7 @@ private:
 
     void signal_pending_reads()
     {
-        if (!read_async_initialized_ || read_async_closing_)
+        if (!read_async_ || read_async_closing_)
             return;
 
         bool has_pending = false;
@@ -215,7 +285,7 @@ private:
         }
 
         if (has_pending)
-            uv_async_send(&read_async_);
+            uv_async_send(read_async_);
     }
 
     Napi::Value make_result(Napi::Env env, const TensorMeta &meta, uint64_t seq, bool copy)
@@ -299,18 +369,26 @@ private:
 
     void flush_pending_reads()
     {
+        if (env_closing_)
+        {
+            clear_pending_reads();
+            return;
+        }
+
         Napi::HandleScope scope(env_);
 
         std::deque<std::shared_ptr<PendingRead>> pending;
         {
             std::lock_guard<std::mutex> lock(pending_reads_mu_);
             pending.swap(pending_reads_);
+            sync_async_ref_with_pending(false);
         }
 
         if (pending.empty())
             return;
 
         std::deque<std::shared_ptr<PendingRead>> still_waiting;
+        bool needs_retry_kick = false;
         for (const auto &item : pending)
         {
             if (!mapped_)
@@ -328,6 +406,8 @@ private:
             else
             {
                 still_waiting.push_back(item);
+                if (status == ReadStatus::RetryNeeded)
+                    needs_retry_kick = true;
             }
         }
 
@@ -336,12 +416,18 @@ private:
             std::lock_guard<std::mutex> lock(pending_reads_mu_);
             for (auto &item : still_waiting)
                 pending_reads_.push_back(std::move(item));
+            sync_async_ref_with_pending(true);
         }
+
+        // If we woke during an in-progress commit, retry once more without
+        // waiting for another writer signal to avoid stranded pending promises.
+        if (needs_retry_kick && read_async_)
+            uv_async_send(read_async_);
     }
 
     void unmap(bool reject_waiters)
     {
-        if (reject_waiters)
+        if (reject_waiters && !env_closing_)
             reject_pending_reads("Destroyed");
         else
             clear_pending_reads();
@@ -457,7 +543,7 @@ private:
             src_size = ta.ByteLength();
         }
 
-        const size_t capacity = mapped_size_ - DATA_OFFSET;
+        const size_t capacity = max_bytes_;
         if (src_size > capacity)
         {
             Napi::RangeError::New(env, "tensor byte size exceeds segment capacity").ThrowAsJavaScriptException();
@@ -510,6 +596,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(pending_reads_mu_);
             pending_reads_.push_back(pending);
+            sync_async_ref_with_pending(true);
         }
 
         return pending->deferred.Promise();
@@ -526,7 +613,7 @@ private:
     {
         if (!mapped_)
             return Napi::Number::New(info.Env(), 0);
-        return Napi::Number::New(info.Env(), static_cast<double>(mapped_size_ - DATA_OFFSET));
+        return Napi::Number::New(info.Env(), static_cast<double>(max_bytes_));
     }
 };
 
