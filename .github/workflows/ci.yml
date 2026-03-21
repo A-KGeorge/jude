@@ -256,7 +256,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
       - name: Install jude-map (peer dep)
-        run: cd ../jude-map && npm ci --ignore-scripts && npm run build
+        run: cd ../jude-map && npm ci --ignore-scripts && npm run build:ts
 
       - run: npm ci --ignore-scripts
 
