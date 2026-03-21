@@ -1,6 +1,6 @@
 {
   "name": "jude-map",
-  "version": "0.2.0",
+  "version": "0.1.1",
   "description": "",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -76,3 +76,4 @@
     "typescript": "^5.9.3"
   }
 }
+
