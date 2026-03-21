@@ -19,7 +19,11 @@
     "build":        "npm run build:ts && npm run build:native",
     "test":         "node scripts/test.js",
     "test:clean":   "node -e \"require('fs').rmSync('./test/test.db', { force: true })\" && npm test",
-    "test:install": "node scripts/test-install.js"
+    "test:install": "node scripts/test-install.js",
+    "prebuildify": "prebuildify --napi --strip --target 18.0.0 --target 20.0.0 --target 22.0.0 --target 24.0.0",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "publish-packages": "changeset publish"
   },
   "binary": {
     "napi_versions": [
@@ -47,9 +51,12 @@
     "node-gyp-build":  "^4.8.4"
   },
   "devDependencies": {
+    "@changesets/changelog-github": "^0.6.0",
+    "@changesets/cli": "^2.30.0",
     "@types/node": "^25.0.0",
     "tsx":         "^4.0.0",
-    "typescript":  "^5.0.0"
+    "typescript":  "^5.0.0",
+    "prebuildify": "^6.0.1"
   },
   "repository": {
     "type": "git",
