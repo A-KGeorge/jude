@@ -21,6 +21,7 @@ jobs:
   changes:
     name: Detect changed packages
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       jude-map: ${{ steps.filter.outputs.jude-map }}
       jude-tf: ${{ steps.filter.outputs.jude-tf }}
@@ -52,6 +53,7 @@ jobs:
       needs.changes.outputs.ci == 'true' ||
       github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
     defaults:
       run:
         working-directory: jude-map
@@ -98,6 +100,7 @@ jobs:
     needs: test-jude-map
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: jude-map
@@ -139,6 +142,7 @@ jobs:
       needs.changes.outputs.ci == 'true' ||
       github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -187,6 +191,7 @@ jobs:
       needs.changes.outputs.ci == 'true' ||
       github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: jude-tf
@@ -272,6 +277,7 @@ jobs:
     needs: test-jude-tf
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     defaults:
       run:
         working-directory: jude-tf
@@ -355,6 +361,7 @@ jobs:
   release:
     name: Release and Publish
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [prebuild-jude-map, prebuild-jude-tf]
     if: |
       always() &&
@@ -423,6 +430,7 @@ jobs:
   lint:
     name: Lint and type-check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
