@@ -34,8 +34,10 @@ jobs:
           filters: |
             jude-map:
               - 'jude-map/**'
+              - '.changeset/**'
             jude-tf:
               - 'jude-tf/**'
+              - '.changeset/**'
             ci:
               - '.github/workflows/**'
 
@@ -354,7 +356,12 @@ jobs:
     name: Release and Publish
     runs-on: ubuntu-latest
     needs: [prebuild-jude-map, prebuild-jude-tf]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: |
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      (needs.prebuild-jude-map.result == 'success' || needs.prebuild-jude-map.result == 'skipped') &&
+      (needs.prebuild-jude-tf.result == 'success' || needs.prebuild-jude-tf.result == 'skipped')
     permissions:
       contents: write
       pull-requests: write
@@ -380,6 +387,7 @@ jobs:
         working-directory: jude-tf
 
       - name: Download jude-map prebuilds
+        if: needs.prebuild-jude-map.result == 'success'
         uses: actions/download-artifact@v4
         with:
           pattern: jude-map-prebuilds-*
@@ -387,6 +395,7 @@ jobs:
           merge-multiple: true
 
       - name: Download jude-tf prebuilds
+        if: needs.prebuild-jude-tf.result == 'success'
         uses: actions/download-artifact@v4
         with:
           pattern: jude-tf-prebuilds-*
@@ -395,8 +404,8 @@ jobs:
 
       - name: Verify prebuilds
         run: |
-          echo "── jude-map ──" && ls jude-map/prebuilds/
-          echo "── jude-tf ──"  && ls jude-tf/prebuilds/
+          if [ -d jude-map/prebuilds ]; then echo "── jude-map ──" && ls jude-map/prebuilds/; else echo "jude-map prebuilds skipped"; fi
+          if [ -d jude-tf/prebuilds ]; then echo "── jude-tf ──" && ls jude-tf/prebuilds/; else echo "jude-tf prebuilds skipped"; fi
 
       - uses: changesets/action@v1
         with:
