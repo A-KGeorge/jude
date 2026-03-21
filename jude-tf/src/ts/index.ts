@@ -188,6 +188,16 @@ export class TFSession {
     return sigs["serving_default"] ?? Object.values(sigs)[0] ?? null;
   }
 
+  /** Inferred Placeholder op names for frozen graphs. Empty for SavedModels. */
+  get inputs(): string[] {
+    return this._native.inputs ?? [];
+  }
+
+  /** Inferred output op names for frozen graphs. Empty for SavedModels. */
+  get outputs(): string[] {
+    return this._native.outputs ?? [];
+  }
+
   // -------------------------------------------------------------------------
   // Lifecycle
   // -------------------------------------------------------------------------
