@@ -78,7 +78,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 
       - run: npm run build
 
@@ -116,7 +116,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 
       - run: npm run prebuildify
 
@@ -227,9 +227,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
       - name: Install jude-map (peer dep)
-        run: cd ../jude-map && npm ci && npm run build
+        run: cd ../jude-map && npm ci --ignore-scripts && npm run build
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 
       - run: npm run build
 
@@ -283,7 +283,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 
       - run: npm run prebuildify
 
@@ -317,7 +317,7 @@ jobs:
 
       - run: npm install -g npm@latest
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 
       - run: npm run build:ts
         working-directory: jude-map
@@ -369,10 +369,10 @@ jobs:
 
       - name: Type-check jude-map
         working-directory: jude-map
-        run: npm ci && npx tsc --noEmit
+        run: npm ci --ignore-scripts && npx tsc --noEmit
         continue-on-error: true
 
       - name: Type-check jude-tf
         working-directory: jude-tf
-        run: npm ci && npx tsc --noEmit
+        run: npm ci --ignore-scripts && npx tsc --noEmit
         continue-on-error: true
