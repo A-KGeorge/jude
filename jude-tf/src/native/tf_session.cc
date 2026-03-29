@@ -501,10 +501,8 @@ private:
         StatusGuard status;
         TF_SessionRun(
             session_, nullptr,
-            tf_inputs.data(), tf_input_tensors.data(),
-            static_cast<int>(tf_inputs.size()),
-            tf_outputs.data(), output_tensors.data(),
-            static_cast<int>(tf_outputs.size()),
+            tf_inputs.data(), tf_input_tensors.data(), static_cast<int>(tf_inputs.size()),
+            tf_outputs.data(), output_tensors.data(), static_cast<int>(tf_outputs.size()),
             nullptr, 0, nullptr, status.s);
 
         for (auto *t : tf_input_tensors)
@@ -515,9 +513,7 @@ private:
             for (auto *t : output_tensors)
                 if (t)
                     TF_DeleteTensor(t);
-            deferred.Reject(Napi::Error::New(env,
-                                             "TF_SessionRun failed: " + status.message())
-                                .Value());
+            deferred.Reject(Napi::Error::New(env, "TF_SessionRun failed: " + status.message()).Value());
             return deferred.Promise();
         }
 
@@ -527,7 +523,8 @@ private:
             if (!output_tensors[i])
                 continue;
             result.Set(output_keys[i], tensor_to_js(env, output_tensors[i]));
-            TF_DeleteTensor(output_tensors[i]);
+
+            // TF_DeleteTensor(output_tensors[i]); // REMOVED: caller now owns the tensor memory via zero-copy ArrayBuffer finalizer
         }
 
         deferred.Resolve(result);
@@ -640,7 +637,7 @@ private:
                 if (!t)
                     continue;
                 result.Set(ctx->output_keys[i], ctx->owner->tensor_to_js(env, t));
-                TF_DeleteTensor(t);
+                // TF_DeleteTensor(t); // REMOVED: caller now owns the tensor memory via zero-copy ArrayBuffer finalizer
             }
             ctx->deferred.Resolve(result);
         }
@@ -863,8 +860,17 @@ private:
         obj.Set("dtype", Napi::Number::New(env, static_cast<double>(dtype)));
         obj.Set("shape", shape);
 
-        Napi::ArrayBuffer buf = Napi::ArrayBuffer::New(env, nb);
-        std::memcpy(buf.Data(), TF_TensorData(t), nb);
+        // ZERO-COPY: Wrap the TF_Tensor memory directly
+        // The finalizer ensures TF_DeleteTensor is called when the JS buffer is GC'd
+        Napi::ArrayBuffer buf = Napi::ArrayBuffer::New(
+            env,
+            TF_TensorData(t),
+            nb,
+            [](Napi::Env /*env*/, void * /*finalize_data*/, TF_Tensor *tensor)
+            {
+                TF_DeleteTensor(tensor);
+            },
+            t);
         obj.Set("data", tf_dtype_to_typed_array(env, dtype, buf, nb));
         return obj;
     }

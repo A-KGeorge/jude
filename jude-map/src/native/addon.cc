@@ -89,6 +89,7 @@ public:
     {
         Napi::Function func = DefineClass(env, "SharedTensor", {
                                                                    InstanceMethod<&SharedTensor::Write>("write"),
+                                                                   InstanceMethod<&SharedTensor::WriteAsync>("writeAsync"),
                                                                    InstanceMethod<&SharedTensor::Fill>("fill"),
                                                                    InstanceMethod<&SharedTensor::FillAsync>("fillAsync"),
                                                                    InstanceMethod<&SharedTensor::Read>("read"),
@@ -197,6 +198,173 @@ private:
         RetryNeeded,
         Destroyed,
     };
+
+    static void parallel_write(void *dest, const void *src, size_t size) noexcept
+    {
+        // For smaller buffers, the overhead of threading isn't worth it.
+        if (size < 4 * 1024 * 1024)
+        {
+            std::memcpy(dest, src, size);
+            return;
+        }
+
+        unsigned hw = std::thread::hardware_concurrency();
+        unsigned threads = std::min<unsigned>(8, hw);
+        if (threads <= 1)
+        {
+            std::memcpy(dest, src, size);
+            return;
+        }
+
+        std::vector<std::thread> workers;
+        workers.reserve(threads - 1);
+
+        uint8_t *d = static_cast<uint8_t *>(dest);
+        const uint8_t *s = static_cast<const uint8_t *>(src);
+        const size_t chunk = size / threads;
+
+        for (unsigned i = 0; i < threads - 1; ++i)
+        {
+            workers.emplace_back([=]()
+                                 { std::memcpy(d + i * chunk, s + i * chunk, chunk); });
+        }
+
+        // Handle the remainder in the current pool thread
+        std::memcpy(d + (threads - 1) * chunk, s + (threads - 1) * chunk, size - (threads - 1) * chunk);
+
+        for (auto &w : workers)
+            w.join();
+    }
+
+    // Updated Context to handle both Fill and Write
+    // Update AsyncWorkCtx in your SharedTensor class
+    struct AsyncWorkCtx
+    {
+        uv_work_t req;
+        enum class Type
+        {
+            Fill,
+            Write
+        } type;
+
+        // Data pointers
+        void *dest;
+        void *src;      // used for Write
+        size_t size;    // byte size for Write/Metadata
+        size_t n_elems; // element count for Fill
+        double fill_value;
+
+        // Metadata for the Seqlock commit
+        SegmentHeader *hdr;
+        DType dtype;
+        uint32_t ndim;
+        uint64_t shape[MAX_DIMS];
+
+        // Lifecycle references
+        Napi::Promise::Deferred deferred;
+        Napi::ObjectReference self_ref;
+        Napi::ObjectReference src_ref; // Keep source buffer alive during Write
+        SharedTensor *owner;
+
+        AsyncWorkCtx(Napi::Env env, Type t)
+            : req{}, type(t), dest(nullptr), src(nullptr), size(0), n_elems(0),
+              fill_value(0.0), hdr(nullptr), dtype(DType::UNKNOWN), ndim(0), shape{},
+              deferred(Napi::Promise::Deferred::New(env)), owner(nullptr) {}
+    };
+
+    void start_async_work(AsyncWorkCtx *ctx)
+    {
+        Napi::Env env = ctx->deferred.Env();
+
+        // 1. Mark the Seqlock as "writing" immediately on the main thread
+        ctx->hdr->seqlock.write_begin();
+
+        uv_loop_t *loop = nullptr;
+        napi_get_uv_event_loop(env, &loop);
+
+        // 2. Queue the work
+        int rc = uv_queue_work(loop, &ctx->req,
+                               &SharedTensor::OnAsyncWork,
+                               &SharedTensor::OnAsyncAfter);
+
+        if (rc != 0)
+        {
+            ctx->hdr->seqlock.write_end();
+            ctx->deferred.Reject(Napi::Error::New(env, "Failed to queue async work").Value());
+            ctx->self_ref.Unref();
+            if (ctx->type == AsyncWorkCtx::Type::Write)
+                ctx->src_ref.Unref();
+            delete ctx;
+        }
+    }
+
+    // Generic Queue Start
+    void enqueue_op(AsyncWorkCtx *ctx)
+    {
+        {
+            std::lock_guard<std::mutex> lock(fill_queue_mu_); // Reuse existing mutex
+            if (fill_inflight_)
+            {
+                // Re-using the existing deque by casting or updating the type
+                // For simplicity, let's keep your existing logic but use the new WorkCtx
+                pending_fills_.push_back(reinterpret_cast<FillWorkCtx *>(ctx));
+                return;
+            }
+            fill_inflight_ = true;
+        }
+        start_async_work(ctx);
+    }
+
+    static void OnAsyncWork(uv_work_t *req)
+    {
+
+        auto *ctx = reinterpret_cast<AsyncWorkCtx *>(req);
+
+        if (ctx->type == AsyncWorkCtx::Type::Write)
+        {
+            // This is where the 8-thread parallel magic happens
+            // but it's happening AWAY from the JavaScript thread.
+            parallel_write(ctx->dest, ctx->src, ctx->size);
+        }
+        else if (ctx->type == AsyncWorkCtx::Type::Fill)
+        {
+            parallel_fill(ctx->dest, ctx->n_elems, dtype_itemsize(ctx->dtype), ctx->dtype, ctx->fill_value);
+        }
+    }
+
+    static void OnAsyncAfter(uv_work_t *req, int status)
+    {
+        auto *ctx = reinterpret_cast<AsyncWorkCtx *>(req);
+        Napi::Env env = ctx->deferred.Env();
+        Napi::HandleScope scope(env);
+
+        // 1. Commit metadata
+        ctx->hdr->meta.ndim = ctx->ndim;
+        ctx->hdr->meta.dtype = ctx->dtype;
+        ctx->hdr->meta.byte_length = ctx->size;
+        std::memcpy(ctx->hdr->meta.shape, ctx->shape, sizeof(ctx->shape));
+
+        // 2. Release Seqlock and wake readers
+        ctx->hdr->seqlock.write_end();
+        if (ctx->owner)
+            ctx->owner->signal_pending_reads();
+
+        // 3. Resolve the JS Promise
+        ctx->deferred.Resolve(env.Undefined());
+
+        // 4. Capture owner to signal next in queue
+        SharedTensor *owner = ctx->owner;
+
+        // 5. Cleanup references
+        if (ctx->type == AsyncWorkCtx::Type::Write)
+            ctx->src_ref.Unref();
+        ctx->self_ref.Unref();
+        delete ctx;
+
+        // 6. FIX: Reset the inflight flag and process next pending op
+        if (owner)
+            owner->on_fill_finished();
+    }
 
     struct PendingRead
     {
@@ -733,6 +901,11 @@ private:
             return Napi::Boolean::New(env, true);
 
         pinned_ = platform_mlock(mapped_, mapped_size_);
+        if (!pinned_)
+        {
+            // Log a hint about RLIMIT_MEMLOCK on Linux or SeLockMemoryPrivilege on Windows
+            fprintf(stderr, "jude-map: Pin failed. Check OS memory-locking limits (e.g., ulimit -l).\n");
+        }
         return Napi::Boolean::New(env, pinned_);
     }
 
@@ -1489,11 +1662,85 @@ private:
         {
             hdr->meta.shape[i] = shape_arr.Get(i).As<Napi::Number>().Uint32Value();
         }
-        std::memcpy(segment_data_ptr(mapped_), src_ptr, src_size); // Fixed typo
+        std::memcpy(segment_data_ptr(mapped_), src_ptr, src_size);
 
         hdr->seqlock.write_end();
         signal_pending_reads();
         return env.Undefined();
+    }
+
+    Napi::Value WriteAsync(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        if (!mapped_)
+        {
+            Napi::Error::New(env, "Destroyed").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        // 1. Parse Arguments (Shape, DType, Buffer) - similar to sync Write()
+        DType dtype;
+        if (info[1].IsNumber())
+        {
+            // If the TS wrapper passes an integer ID
+            dtype = static_cast<DType>(info[1].As<Napi::Number>().Uint32Value());
+        }
+        else
+        {
+            // Fallback for string input
+            std::string s = info[1].As<Napi::String>().Utf8Value();
+            dtype = dtype_from_string(s.c_str());
+        }
+
+        if (dtype == DType::UNKNOWN)
+        {
+            Napi::TypeError::New(env, "Unsupported dtype").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        uint8_t *src_ptr = nullptr;
+        size_t src_size = 0;
+        Napi::Array shape_arr = info[0].As<Napi::Array>();
+        uint32_t ndim = shape_arr.Length();
+
+        if (info[2].IsArrayBuffer())
+        {
+            auto ab = info[2].As<Napi::ArrayBuffer>();
+            src_ptr = reinterpret_cast<uint8_t *>(ab.Data());
+            src_size = ab.ByteLength();
+        }
+        else
+        {
+            auto ta = info[2].As<Napi::TypedArray>();
+            src_ptr = reinterpret_cast<uint8_t *>(ta.ArrayBuffer().Data()) + ta.ByteOffset();
+            src_size = ta.ByteLength();
+        }
+
+        // 2. Initialize Context
+        auto *ctx = new AsyncWorkCtx(env, AsyncWorkCtx::Type::Write);
+        ctx->dest = segment_data_ptr(mapped_);
+        ctx->src = src_ptr;
+        ctx->size = src_size;
+        ctx->hdr = reinterpret_cast<SegmentHeader *>(mapped_);
+        ctx->owner = this;
+
+        // 3. Metadata snapshot (Must copy values now, as JS array might change)
+        ctx->dtype = dtype;
+        ctx->ndim = ndim;
+        for (uint32_t i = 0; i < ndim; ++i)
+        {
+            ctx->shape[i] = static_cast<uint64_t>(shape_arr.Get(i).As<Napi::Number>().Int64Value());
+        }
+
+        // 4. Protect memory from GC
+        // Keep the source buffer and 'this' alive during the background copy
+        ctx->src_ref = Napi::ObjectReference::New(info[2].As<Napi::Object>(), 1);
+        ctx->self_ref = Napi::ObjectReference::New(info.This().As<Napi::Object>(), 1);
+
+        // 5. START SEQLOCK & QUEUE
+        enqueue_op(ctx);
+
+        return ctx->deferred.Promise();
     }
 
     Napi::Value read_internal(const Napi::CallbackInfo &info, bool copy)

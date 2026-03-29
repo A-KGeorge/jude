@@ -6,6 +6,16 @@
 // The counter is odd while a write is in progress.
 // Isolated to its own 64-byte cache line so writer updates to the counter
 // do not invalidate the reader's cache of the tensor metadata block.
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define CPU_PAUSE() _mm_pause()
+#elif defined(__arm__) || defined(__aarch64__)
+#define CPU_PAUSE() __asm__ volatile("yield" ::: "memory")
+#else
+#define CPU_PAUSE() std::this_thread::yield()
+#endif
+
 #include <atomic>
 
 struct alignas(64) Seqlock
@@ -30,10 +40,13 @@ struct alignas(64) Seqlock
     inline uint64_t read_begin() const noexcept
     {
         uint64_t seq;
-        do
+        while (true)
         {
             seq = sequence.load(std::memory_order_acquire);
-        } while (seq & 1u); // spin while odd
+            if (!(seq & 1u))
+                break;   // if even, no write in progress, proceed to read
+            CPU_PAUSE(); // if odd, writer is in progress, pause and retry
+        }
         return seq;
     }
 

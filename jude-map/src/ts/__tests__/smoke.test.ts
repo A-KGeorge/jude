@@ -174,4 +174,74 @@ describe("SharedTensorSegment", () => {
     seg.destroy();
     assert.equal(torn, 0, `${torn} torn reads detected`);
   });
+
+  it("writeAsync float32 resolves with correct data", async () => {
+    const MB = 1024 * 1024;
+    const seg = new SharedTensorSegment(64 * MB);
+    const val = 1.23;
+    const input = new Float32Array((64 * MB) / 4).fill(val);
+
+    // Non-blocking write
+    await seg.writeAsync([input.length], DType.FLOAT32, input);
+
+    const out = seg.read();
+    assert.notEqual(out, null);
+    assert.equal((out!.data as Float32Array)[0], Math.fround(val));
+    assert.equal(
+      (out!.data as Float32Array)[input.length - 1],
+      Math.fround(val),
+    );
+
+    seg.destroy();
+  });
+
+  it("event loop interleaves during large writeAsync", async () => {
+    const MB = 1024 * 1024;
+    const seg = new SharedTensorSegment(128 * MB);
+    const input = new Float32Array((128 * MB) / 4);
+
+    let timerFired = false;
+    const t = setTimeout(() => {
+      timerFired = true;
+    }, 0);
+
+    const t0 = performance.now();
+    await seg.writeAsync([input.length], DType.FLOAT32, input);
+    const dt = performance.now() - t0;
+
+    // If the write took long enough, the timer should have had a chance to fire
+    if (dt > 15) {
+      assert.ok(timerFired, "Event loop was blocked during writeAsync");
+    }
+
+    clearTimeout(t);
+    seg.destroy();
+  });
+
+  it("seqlock stress with high-frequency async writes", async () => {
+    const seg = new SharedTensorSegment(4 * 1024);
+    const ITERS = 1000;
+    let failures = 0;
+
+    // Start a continuous background writer using fillAsync
+    const writer = (async () => {
+      for (let i = 0; i < ITERS; i++) {
+        await seg.fillAsync([1024], DType.FLOAT32, i);
+      }
+    })();
+
+    // Simultaneously perform rapid reads
+    for (let i = 0; i < ITERS; i++) {
+      const out = seg.read();
+      if (out) {
+        const data = out.data as Float32Array;
+        const first = data[0];
+        if (data.some((v) => v !== first)) failures++;
+      }
+    }
+
+    await writer;
+    seg.destroy();
+    assert.equal(failures, 0, "Torn reads detected during async contention");
+  });
 });

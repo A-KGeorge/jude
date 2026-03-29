@@ -138,6 +138,20 @@ export class SharedTensorSegment {
   }
 
   /**
+   * Write a tensor asynchronously, off the main event loop thread. Resolves when the seqlock commit is complete and readWait() callers have been woken.
+   *
+   * Use on the main thread to keep the event loop alive during large writes.
+   * Use on Worker threads where blocking the isolated event loop is fine.
+   */
+  async writeAsync(
+    shape: number[],
+    dtype: DType,
+    buffer: ArrayBuffer | TypedArray,
+  ): Promise<void> {
+    return this._native.writeAsync(shape, dtype, buffer);
+  }
+
+  /**
    * Fill every element with a scalar value, entirely in C++.
    * Synchronous — blocks the calling thread until complete.
    *

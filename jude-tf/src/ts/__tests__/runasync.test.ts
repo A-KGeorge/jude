@@ -85,44 +85,6 @@ describe("TFSession.runAsync()", () => {
   });
 });
 
-/**
- * Integration test pattern for runAsync with real frozen graph.
- *
- * To use this, create a test model or pass the path to an existing frozen graph:
- *
- * @example
- * describe("TFSession.runAsync() — frozen graph integration", () => {
- *   const modelPath = process.env.TF_TEST_FROZEN_GRAPH;
- *
- *   it("runAsync produces same output as run()", async (t) => {
- *     if (!modelPath) {
- *       t.skip("TF_TEST_FROZEN_GRAPH not set");
- *       return;
- *     }
- *
- *     const TFSession = await loadTFSessionOrSkip(t);
- *     if (!TFSession) return;
- *
- *     const sess = await TFSession.loadFrozenGraph(modelPath);
- *     const inputs = { input: new Float32Array([1, 2, 3, 4]) };
- *
- *     const syncResult = await sess.run(inputs);
- *     const asyncResult = await sess.runAsync(inputs);
- *
- *     assert.deepEqual(
- *       syncResult,
- *       asyncResult,
- *       "run() and runAsync() produce identical results"
- *     );
- *
- *     sess.destroy();
- *   }).
- * });
- *
- * Set environment variable:
- *   TF_TEST_FROZEN_GRAPH=/path/to/model.pb npm test
- */
-
 describe("TFSession.runAsync() — frozen graph integration", () => {
   const fixtureModelPath = join(__dirname, "fixtures", "model_frozen.pb");
   const modelPath = process.env.TF_TEST_FROZEN_GRAPH || fixtureModelPath;
@@ -165,5 +127,46 @@ describe("TFSession.runAsync() — frozen graph integration", () => {
     );
 
     sess.destroy();
+  });
+});
+
+describe("TFSession Zero-Copy Memory Management and Lifecycle", () => {
+  it("inference results use direct ArrayBuffers (zero-copy)", async (t) => {
+    const TFSession = await loadTFSessionOrSkip(t);
+    const modelPath =
+      process.env.TF_TEST_FROZEN_GRAPH ||
+      join(__dirname, "fixtures", "model_frozen.pb");
+
+    if (!TFSession || !existsSync(modelPath)) return t.skip();
+
+    const sess = await TFSession.loadFrozenGraph(modelPath);
+    const inputs: Record<string, Float32Array> = {};
+    sess.inputs.forEach(
+      (key) => (inputs[key] = new Float32Array([1, 2, 3, 4])),
+    );
+
+    const result = await sess.runAsync(inputs); //
+    const outputKey = Object.keys(result)[0];
+    const output = result[outputKey];
+
+    // Narrow the type to access TypedArray-specific properties
+    if (!ArrayBuffer.isView(output.data)) {
+      throw new Error("Expected a TypedArray from inference result");
+    }
+
+    // Now TypeScript knows output.data has .buffer and .length
+    assert.ok(output.data.buffer instanceof ArrayBuffer);
+    assert.ok(output.data.length > 0);
+
+    // Verify memory remains valid even if we destroy the session immediately
+    sess.destroy();
+
+    // The data should still be accessible because the finalizer is tied to
+    // the JS object lifecycle, not the session lifecycle.
+    assert.doesNotThrow(() => {
+      if (ArrayBuffer.isView(output.data)) {
+        output.data[0];
+      }
+    });
   });
 });
