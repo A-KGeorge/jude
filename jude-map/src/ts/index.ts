@@ -137,6 +137,13 @@ function wrap(result: any): TensorResult | null {
 export class SharedTensorSegment {
   /** @internal */ _native: any;
 
+  // Cached SAB reference for cross-thread segments.
+  // We cache this in TS rather than round-tripping through the C++ getter
+  // because napi_get_typedarray_info returns an ArrayBuffer-typed napi_value
+  // on some platforms (Windows), which then fails instanceof SharedArrayBuffer
+  // when passed through workerData structured-clone.
+  private _sab?: SharedArrayBuffer;
+
   // ── Constructors (private) ─────────────────────────────────────────────────
   // Public entry points: new SharedTensorSegment(maxBytes) for mmap segments,
   // SharedTensorSegment.createShared(maxBytes) for cross-thread SAB segments.
@@ -153,7 +160,10 @@ export class SharedTensorSegment {
     const seg = Object.create(
       SharedTensorSegment.prototype,
     ) as SharedTensorSegment;
+    // Pass Uint8Array view — native constructor detects IsTypedArray(), not SAB directly.
     seg._native = new NativeSharedTensor(new Uint8Array(sab), initHeader);
+    // Cache the SAB so sharedBuffer never needs the C++ getter.
+    seg._sab = sab;
     return seg;
   }
 
@@ -183,12 +193,7 @@ export class SharedTensorSegment {
   static createShared(maxBytes: number): SharedTensorSegment {
     if (maxBytes <= 0) throw new RangeError("maxBytes must be > 0");
     const sab = new SharedArrayBuffer(DATA_OFFSET + maxBytes);
-    const view = new Uint8Array(sab); // proxy for the SAB
-    const seg = Object.create(
-      SharedTensorSegment.prototype,
-    ) as SharedTensorSegment;
-    seg._native = new NativeSharedTensor(view, true);
-    return seg;
+    return SharedTensorSegment._fromSAB(sab, /* initHeader */ true);
   }
 
   /**
@@ -208,22 +213,21 @@ export class SharedTensorSegment {
     sab: SharedArrayBuffer,
     maxBytes: number,
   ): SharedTensorSegment {
-    if (!(sab instanceof SharedArrayBuffer))
-      throw new TypeError("sab must be a SharedArrayBuffer");
+    // Use Object.prototype.toString for cross-realm safety — instanceof
+    // SharedArrayBuffer can fail when the value crosses V8 isolate boundaries
+    // (e.g. coming from a different module realm or via napi_get_typedarray_info).
+    const tag = Object.prototype.toString.call(sab);
+    if (tag !== "[object SharedArrayBuffer]")
+      throw new TypeError(`sab must be a SharedArrayBuffer, got ${tag}`);
     if (sab.byteLength < DATA_OFFSET)
       throw new RangeError(
-        `SharedArrayBuffer must be at least ${DATA_OFFSET} bytes`,
+        `SharedArrayBuffer must be at least ${DATA_OFFSET} bytes, got ${sab.byteLength}`,
       );
     if (maxBytes <= 0 || DATA_OFFSET + maxBytes > sab.byteLength)
       throw new RangeError(
         `maxBytes (${maxBytes}) inconsistent with SAB size (${sab.byteLength})`,
       );
-    const view = new Uint8Array(sab); // proxy for the SAB
-    const seg = Object.create(
-      SharedTensorSegment.prototype,
-    ) as SharedTensorSegment;
-    seg._native = new NativeSharedTensor(view, false);
-    return seg;
+    return SharedTensorSegment._fromSAB(sab, /* initHeader */ false);
   }
 
   // ── SAB accessor ───────────────────────────────────────────────────────────
@@ -239,6 +243,10 @@ export class SharedTensorSegment {
    * structured-clone transfers the handle without copying the underlying memory.
    */
   get sharedBuffer(): SharedArrayBuffer {
+    if (this._sab !== undefined) return this._sab;
+    // Fallback to C++ getter — will throw for mmap-backed segments with a
+    // clear message. Only reached if this instance was constructed via a
+    // path that didn't go through _fromSAB (e.g. new SharedTensorSegment(n)).
     return this._native.sharedBuffer as SharedArrayBuffer;
   }
 
