@@ -183,7 +183,12 @@ export class SharedTensorSegment {
   static createShared(maxBytes: number): SharedTensorSegment {
     if (maxBytes <= 0) throw new RangeError("maxBytes must be > 0");
     const sab = new SharedArrayBuffer(DATA_OFFSET + maxBytes);
-    return SharedTensorSegment._fromSAB(sab, /* initHeader */ true);
+    const view = new Uint8Array(sab); // proxy for the SAB
+    const seg = Object.create(
+      SharedTensorSegment.prototype,
+    ) as SharedTensorSegment;
+    seg._native = new NativeSharedTensor(view, true);
+    return seg;
   }
 
   /**
@@ -207,13 +212,18 @@ export class SharedTensorSegment {
       throw new TypeError("sab must be a SharedArrayBuffer");
     if (sab.byteLength < DATA_OFFSET)
       throw new RangeError(
-        `SharedArrayBuffer must be at least ${DATA_OFFSET} bytes, got ${sab.byteLength}`,
+        `SharedArrayBuffer must be at least ${DATA_OFFSET} bytes`,
       );
     if (maxBytes <= 0 || DATA_OFFSET + maxBytes > sab.byteLength)
       throw new RangeError(
         `maxBytes (${maxBytes}) inconsistent with SAB size (${sab.byteLength})`,
       );
-    return SharedTensorSegment._fromSAB(sab, /* initHeader */ false);
+    const view = new Uint8Array(sab); // proxy for the SAB
+    const seg = Object.create(
+      SharedTensorSegment.prototype,
+    ) as SharedTensorSegment;
+    seg._native = new NativeSharedTensor(view, false);
+    return seg;
   }
 
   // ── SAB accessor ───────────────────────────────────────────────────────────
