@@ -257,6 +257,7 @@ public:
                         JUDE_LOG("ctor SAB: SegmentHeader placement-newed at %p", mapped_);
                         break;
                     case SegmentMode::RCU:
+                        max_bytes_ = (mapped_size_ - RCU_HEADER_SIZE) / 2;
                         rcu_init_header(mapped_);
                         break;
                     case SegmentMode::RING:
