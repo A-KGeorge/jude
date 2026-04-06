@@ -371,8 +371,6 @@ jobs:
           node-version: ${{ env.NODE_DEFAULT }}
           registry-url: "https://registry.npmjs.org"
 
-      - run: npm install -g npm@latest
-
       - run: npm ci --ignore-scripts
 
       - run: npm run build:ts
